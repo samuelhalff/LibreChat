@@ -25,7 +25,7 @@ export const genAzureEndpoint = ({
   azureOpenAIApiInstanceName: string;
   azureOpenAIApiDeploymentName: string;
 }): string => {
-  return `https://${azureOpenAIApiInstanceName}.openai.azure.com/openai/deployments/${azureOpenAIApiDeploymentName}`;
+  return `https://${azureOpenAIApiInstanceName}.cognitiveservices.azure.com/openai/deployments/${azureOpenAIApiDeploymentName}`;
 };
 
 /**
