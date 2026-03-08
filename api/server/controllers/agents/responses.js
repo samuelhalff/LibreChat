@@ -15,6 +15,7 @@ const {
   // Responses API
   writeDone,
   buildResponse,
+  emitResponseCompleted,
   generateResponseId,
   isValidationFailure,
   emitResponseCreated,
@@ -22,6 +23,12 @@ const {
   createResponseTracker,
   setupStreamingResponse,
   emitResponseInProgress,
+  emitMessageItemAdded,
+  emitMessageItemDone,
+  emitTextContentPartAdded,
+  emitOutputTextDelta,
+  emitOutputTextDone,
+  emitTextContentPartDone,
   convertInputToMessages,
   validateResponseRequest,
   buildAggregatedResponse,
@@ -40,6 +47,12 @@ const { getConvoFiles, saveConvo, getConvo } = require('~/models/Conversation');
 const { spendTokens, spendStructuredTokens } = require('~/models/spendTokens');
 const { getMultiplier, getCacheMultiplier } = require('~/models/tx');
 const { getAgent, getAgents } = require('~/models/Agent');
+const {
+  buildWorkspaceTaskPrompt,
+  getMessageText,
+  invokeDeterministicLocalAction,
+  resolveDeterministicLocalAction,
+} = require('~/server/services/Endpoints/agents/deterministicWorkspace');
 const db = require('~/models');
 
 /** @type {import('@librechat/api').AppConfig | null} */
@@ -314,6 +327,99 @@ const createResponse = async (req, res) => {
   });
 
   try {
+    // Load previous messages if previous_response_id is provided
+    let previousMessages = [];
+    if (request.previous_response_id) {
+      const userId = req.user?.id ?? 'api-user';
+      previousMessages = await loadPreviousMessages(request.previous_response_id, userId);
+    }
+
+    // Convert input to internal messages
+    const inputMessages = convertToInternalMessages(
+      typeof request.input === 'string' ? request.input : request.input,
+    );
+
+    // Merge previous messages with new input
+    const allMessages = [...previousMessages, ...inputMessages];
+
+    const latestUserText = getMessageText([...inputMessages].reverse().find((msg) => msg.role === 'user'));
+    const directAction = await resolveDeterministicLocalAction({
+      req,
+      res,
+      agent,
+      text: latestUserText,
+      signal: abortController.signal,
+    });
+
+    if (directAction) {
+      const delegatedPrompt =
+        directAction.promptMode === 'workspace_context'
+          ? buildWorkspaceTaskPrompt({
+              messages: allMessages,
+              latestText: latestUserText,
+            })
+          : latestUserText;
+      const directResult = await invokeDeterministicLocalAction({
+        req,
+        res,
+        agent,
+        action: directAction,
+        prompt: delegatedPrompt,
+        responseMessageId: responseId,
+        conversationId,
+        signal: abortController.signal,
+      });
+
+      if (isStreaming) {
+        setupStreamingResponse(res);
+
+        const tracker = createResponseTracker();
+        const handlerConfig = { res, context, tracker };
+
+        emitResponseCreated(handlerConfig);
+        emitResponseInProgress(handlerConfig);
+        emitMessageItemAdded(handlerConfig);
+        emitTextContentPartAdded(handlerConfig);
+        emitOutputTextDelta(handlerConfig, directResult.text);
+        emitOutputTextDone(handlerConfig);
+        emitTextContentPartDone(handlerConfig);
+        emitMessageItemDone(handlerConfig);
+        emitResponseCompleted(handlerConfig);
+        writeDone(res);
+        res.end();
+
+        if (request.store === true) {
+          try {
+            await saveConversation(req, conversationId, agentId, agent);
+            await saveInputMessages(req, conversationId, inputMessages, agentId);
+            const finalResponse = buildResponse(context, tracker, 'completed');
+            await saveResponseOutput(req, conversationId, responseId, finalResponse, agentId);
+          } catch (saveError) {
+            logger.error('[Responses API] Error saving deterministic workspace response:', saveError);
+          }
+        }
+
+        return;
+      }
+
+      const aggregator = createResponseAggregator();
+      aggregator.addText(directResult.text);
+      const response = buildAggregatedResponse(context, aggregator);
+
+      if (request.store === true) {
+        try {
+          await saveConversation(req, conversationId, agentId, agent);
+          await saveInputMessages(req, conversationId, inputMessages, agentId);
+          await saveResponseOutput(req, conversationId, responseId, response, agentId);
+        } catch (saveError) {
+          logger.error('[Responses API] Error saving deterministic workspace response:', saveError);
+        }
+      }
+
+      res.json(response);
+      return;
+    }
+
     // Build allowed providers set
     const allowedProviders = new Set(
       appConfig?.endpoints?.[EModelEndpoint.agents]?.allowedProviders,
@@ -357,21 +463,6 @@ const createResponse = async (req, res) => {
     // Determine if streaming is enabled (check both request and agent config)
     const streamingDisabled = !!primaryConfig.model_parameters?.disableStreaming;
     const actuallyStreaming = isStreaming && !streamingDisabled;
-
-    // Load previous messages if previous_response_id is provided
-    let previousMessages = [];
-    if (request.previous_response_id) {
-      const userId = req.user?.id ?? 'api-user';
-      previousMessages = await loadPreviousMessages(request.previous_response_id, userId);
-    }
-
-    // Convert input to internal messages
-    const inputMessages = convertToInternalMessages(
-      typeof request.input === 'string' ? request.input : request.input,
-    );
-
-    // Merge previous messages with new input
-    const allMessages = [...previousMessages, ...inputMessages];
 
     const toolSet = buildToolSet(primaryConfig);
     const { messages: formattedMessages, indexTokenCountMap } = formatAgentMessages(

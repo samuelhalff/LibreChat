@@ -22,8 +22,13 @@ const {
 const { loadAgentTools, loadToolsForExecution } = require('~/server/services/ToolService');
 const { getModelsConfig } = require('~/server/controllers/ModelController');
 const AgentClient = require('~/server/controllers/agents/client');
+const DirectWorkspaceClient = require('~/server/controllers/agents/directWorkspaceClient');
 const { getConvoFiles } = require('~/models/Conversation');
 const { processAddedConvo } = require('./addedConvo');
+const {
+  isDeterministicAgent,
+  resolveDeterministicLocalAction,
+} = require('./deterministicWorkspace');
 const { getAgent } = require('~/models/Agent');
 const { logViolation } = require('~/cache');
 const db = require('~/models');
@@ -150,6 +155,70 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
   delete endpointOption.agent;
   if (!primaryAgent) {
     throw new Error('Agent not found');
+  }
+
+  if (req.body?.addedConvo != null && isDeterministicAgent(primaryAgent)) {
+    const client = new DirectWorkspaceClient({
+      req,
+      res,
+      sender: primaryAgent.name ?? 'Agent',
+      agent: primaryAgent,
+      spec: endpointOption.spec,
+      iconURL: endpointOption.iconURL,
+      endpointType: endpointOption.endpointType,
+      resendFiles: true,
+      maxContextTokens: 0,
+      endpoint: EModelEndpoint.agents,
+      directAction: {
+        kind: 'message',
+        actionType: 'message',
+        responseText:
+          'This local worker does not support multi-conversation mode. Run it in a single conversation instead.',
+        metadata: {
+          deterministic_local_action: {
+            kind: 'message',
+            reason: 'added_convo_unsupported',
+          },
+        },
+      },
+    });
+
+    if (streamId) {
+      GenerationJobManager.setCollectedUsage(streamId, collectedUsage);
+    }
+
+    return { client, userMCPAuthMap: undefined };
+  }
+
+  const directAction = await resolveDeterministicLocalAction({
+    req,
+    res,
+    agent: primaryAgent,
+    text: req.body?.text,
+    signal,
+    skip: req.body?.addedConvo != null,
+  });
+
+  if (directAction) {
+    const client = new DirectWorkspaceClient({
+      req,
+      res,
+      sender: primaryAgent.name ?? 'Agent',
+      agent: primaryAgent,
+      spec: endpointOption.spec,
+      iconURL: endpointOption.iconURL,
+      endpointType: endpointOption.endpointType,
+      resendFiles: true,
+      maxContextTokens: 0,
+      endpoint: EModelEndpoint.agents,
+      directAction,
+    });
+
+    if (streamId) {
+      GenerationJobManager.setCollectedUsage(streamId, collectedUsage);
+    }
+
+    return { client, userMCPAuthMap: undefined };
   }
 
   const modelsConfig = await getModelsConfig(req);

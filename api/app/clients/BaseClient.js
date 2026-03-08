@@ -697,6 +697,7 @@ class BaseClient {
 
     const balanceConfig = getBalanceConfig(appConfig);
     if (
+      this.skipBalanceCheck !== true &&
       balanceConfig?.enabled &&
       supportsBalanceCheck[this.options.endpointType ?? this.options.endpoint]
     ) {
