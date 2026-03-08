@@ -1089,7 +1089,7 @@ function parseWorkspaceListAction(text) {
   }
 
   if (
-    /\b(?:workspace list|list workspaces|show workspaces|what workspaces|which workspaces|available workspaces|list projects|show projects|what projects|which projects)\b/i.test(
+    /\b(?:workspace list|list(?: me)?(?: the)? workspaces|show(?: me)?(?: the)? workspaces|what(?: are)?(?: the)? workspaces|which workspaces|available workspaces|list(?: me)?(?: the)? projects|show(?: me)?(?: the)? projects|what(?: are)?(?: the)? projects|which projects)\b/i.test(
       text,
     )
   ) {
