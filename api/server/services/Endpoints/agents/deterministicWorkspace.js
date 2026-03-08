@@ -376,6 +376,72 @@ function inferWorkspaceFromText(text, entries = listWorkspaceEntries()) {
   return Array.from(matches.keys())[0];
 }
 
+function matchLeadingWorkspaceEntry(text, entries = listWorkspaceEntries()) {
+  if (typeof text !== 'string' || text.trim() === '') {
+    return null;
+  }
+
+  const trimmed = text.trim();
+  const leadingUnwrapped = trimmed.replace(/^[`'"]+/, '');
+  const lowered = leadingUnwrapped.toLowerCase();
+  /** @type {Map<string, { entry: { path: string; ref: string; name: string; target: string }; alias: string; isBare: boolean; remainingText: string }>} */
+  const matches = new Map();
+
+  for (const entry of entries) {
+    for (const alias of workspaceAliases(entry)) {
+      if (!lowered.startsWith(alias)) {
+        continue;
+      }
+
+      const remainingRaw = leadingUnwrapped.slice(alias.length);
+      const normalizedRemaining = remainingRaw.replace(/^[`'"]+/, '').trim();
+      const isBare =
+        normalizedRemaining === '' || /^[.,:;!?)}\]]+$/.test(normalizedRemaining);
+      if (!isBare) {
+        const separator = remainingRaw[0];
+        if (!separator || !/[\s:;,)\]}\-`'"]/.test(separator)) {
+          continue;
+        }
+      }
+
+      const existing = matches.get(entry.path);
+      if (!existing || alias.length > existing.alias.length) {
+        matches.set(entry.path, {
+          entry,
+          alias,
+          isBare,
+          remainingText: normalizedRemaining,
+        });
+      }
+    }
+  }
+
+  if (matches.size !== 1) {
+    if (matches.size > 1) {
+      logger.debug('[DeterministicWorkspace] Ambiguous leading workspace match in user prompt', {
+        prompt: trimMessageText(text, 240),
+        matches: Array.from(matches.keys()),
+      });
+    }
+    return null;
+  }
+
+  return Array.from(matches.values())[0];
+}
+
+function workspaceRefFromPath(workspacePath) {
+  if (typeof workspacePath !== 'string' || workspacePath.trim() === '') {
+    return 'the workspace';
+  }
+
+  const relativePath = path.relative(DEV_ROOT, workspacePath);
+  if (!relativePath.startsWith('..') && !path.isAbsolute(relativePath)) {
+    return relativePath || path.basename(workspacePath);
+  }
+
+  return path.basename(workspacePath);
+}
+
 function getMessageText(message) {
   if (message == null) {
     return '';
@@ -457,7 +523,7 @@ function buildWorkspaceTaskPrompt({ messages = [], latestText }) {
   ].join('\n');
 }
 
-function getDeterministicWorkspaceDispatch({ agent, text, skip = false }) {
+function getDeterministicWorkspaceDispatch({ agent, text, skip = false, entries = listWorkspaceEntries() }) {
   if (skip) {
     return null;
   }
@@ -467,7 +533,12 @@ function getDeterministicWorkspaceDispatch({ agent, text, skip = false }) {
     return null;
   }
 
-  const workspace = extractWorkspaceHintFromText(text) ?? inferWorkspaceFromText(text);
+  const leadingMatch = matchLeadingWorkspaceEntry(text, entries);
+  const workspace = leadingMatch?.isBare
+    ? null
+    : leadingMatch?.entry.path ??
+      extractWorkspaceHintFromText(text) ??
+      inferWorkspaceFromText(text, entries);
   if (!workspace) {
     return null;
   }
@@ -575,7 +646,13 @@ async function resolveDeterministicWorkspaceDispatch({
     }
   }
 
-  const directDispatch = getDeterministicWorkspaceDispatch({ agent, text, skip });
+  const localEntries = listWorkspaceEntries();
+  const directDispatch = getDeterministicWorkspaceDispatch({
+    agent,
+    text,
+    skip,
+    entries: localEntries,
+  });
   if (directDispatch) {
     return directDispatch;
   }
@@ -589,17 +666,54 @@ async function resolveDeterministicWorkspaceDispatch({
     return null;
   }
 
-  if (!hasPotentialWorkspaceHint(text)) {
+  const entries = await loadWorkspaceEntriesFromMcp({ req, res, agent, signal, userMCPAuthMap });
+  const leadingMatch = matchLeadingWorkspaceEntry(text, entries);
+  if (leadingMatch && !leadingMatch.isBare) {
+    return { ...runtime, workspace: leadingMatch.entry.path };
+  }
+
+  if (!hasPotentialWorkspaceHint(text) && !leadingMatch) {
     return null;
   }
 
-  const entries = await loadWorkspaceEntriesFromMcp({ req, res, agent, signal, userMCPAuthMap });
-  const workspace = inferWorkspaceFromText(text, entries);
+  const workspace = extractWorkspaceHintFromText(text) ?? inferWorkspaceFromText(text, entries);
   if (!workspace) {
     return null;
   }
 
   return { ...runtime, workspace };
+}
+
+async function resolveBareWorkspaceSelection({
+  req,
+  res,
+  agent,
+  text,
+  signal,
+  userMCPAuthMap,
+  skip = false,
+}) {
+  if (skip) {
+    return null;
+  }
+
+  const runtime = deterministicAgentMap[agent?.name];
+  if (!runtime || typeof text !== 'string' || text.trim() === '') {
+    return null;
+  }
+
+  const localMatch = matchLeadingWorkspaceEntry(text);
+  if (localMatch?.isBare) {
+    return localMatch.entry.path;
+  }
+
+  const entries = await loadWorkspaceEntriesFromMcp({ req, res, agent, signal, userMCPAuthMap });
+  const remoteMatch = matchLeadingWorkspaceEntry(text, entries);
+  if (remoteMatch?.isBare) {
+    return remoteMatch.entry.path;
+  }
+
+  return null;
 }
 
 function isDeterministicAgent(agent) {
@@ -641,6 +755,11 @@ function createLocalMessageAction(text) {
 
 function buildLocalAgentFallbackMessage() {
   return LOCAL_AGENT_HELP_TEXT;
+}
+
+function buildWorkspaceSelectionMessage(workspacePath) {
+  const workspaceRef = workspaceRefFromPath(workspacePath);
+  return `Workspace recognized: ${workspaceRef}. Include the task in the same message, for example: "In ${workspaceRef}, tell me which file handles the contact form submit logic."`;
 }
 
 function parseIntValue(value) {
@@ -1150,6 +1269,19 @@ async function resolveDeterministicLocalAction({
     return workspaceListAction;
   }
 
+  const bareWorkspaceSelection = await resolveBareWorkspaceSelection({
+    req,
+    res,
+    agent,
+    text,
+    signal,
+    userMCPAuthMap,
+    skip,
+  });
+  if (bareWorkspaceSelection) {
+    return createLocalMessageAction(buildWorkspaceSelectionMessage(bareWorkspaceSelection));
+  }
+
   const workspaceDispatch = await resolveDeterministicWorkspaceDispatch({
     req,
     res,
@@ -1540,6 +1672,7 @@ module.exports = {
   AI_SYSTEM_SERVER,
   DEV_ROOT,
   buildWorkspaceTaskPrompt,
+  buildWorkspaceSelectionMessage,
   buildLocalAgentFallbackMessage,
   extractWorkspaceHintFromText,
   getDeterministicWorkspaceDispatch,
@@ -1549,8 +1682,11 @@ module.exports = {
   invokeDeterministicWorkspaceTool,
   isDeterministicAgent,
   listWorkspaceEntries,
+  matchLeadingWorkspaceEntry,
   normalizeToolText,
   parseStructuredToolContent,
+  resolveBareWorkspaceSelection,
   resolveDeterministicLocalAction,
   resolveDeterministicWorkspaceDispatch,
+  workspaceRefFromPath,
 };
