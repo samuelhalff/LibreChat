@@ -1,7 +1,7 @@
 const path = require('path');
 const { logger } = require('@librechat/data-schemas');
 const { GenerationJobManager, Tokenizer, sanitizeTitle } = require('@librechat/api');
-const { EModelEndpoint } = require('librechat-data-provider');
+const { ContentTypes, EModelEndpoint } = require('librechat-data-provider');
 const BaseClient = require('~/app/clients/BaseClient');
 const {
   buildWorkspaceTaskPrompt,
@@ -10,6 +10,7 @@ const {
 } = require('~/server/services/Endpoints/agents/deterministicWorkspace');
 
 const MAX_TITLE_CHARS = 80;
+const HEARTBEAT_INTERVAL_MS = 15000;
 
 function buildDeterministicTitle(text) {
   if (typeof text !== 'string') {
@@ -32,6 +33,21 @@ function buildDeterministicTitle(text) {
       : sentence;
 
   return sanitizeTitle(compact);
+}
+
+function buildAgentUpdateEvent({ runId, agentId, message, index = 0 }) {
+  return {
+    event: 'on_agent_update',
+    data: {
+      type: ContentTypes.AGENT_UPDATE,
+      agent_update: {
+        runId,
+        index,
+        agentId: agentId ?? '',
+        ...(typeof message === 'string' && message.trim() ? { message } : {}),
+      },
+    },
+  };
 }
 
 class DirectWorkspaceClient extends BaseClient {
@@ -109,28 +125,51 @@ class DirectWorkspaceClient extends BaseClient {
 
   async sendCompletion(payload, opts = {}) {
     const streamId = this.options.req?._resumableStreamId;
-    if (streamId && this.directAction?.progressMessage) {
-      await GenerationJobManager.emitChunk(streamId, {
-        event: 'on_agent_update',
-        data: {
+    const emitProgressUpdate = async (message) => {
+      if (!streamId || !this.responseMessageId) {
+        return;
+      }
+
+      await GenerationJobManager.emitChunk(
+        streamId,
+        buildAgentUpdateEvent({
           runId: this.responseMessageId,
-          message: this.directAction.progressMessage,
-        },
-      });
+          agentId: this.options.agent?.id,
+          message,
+        }),
+      );
+    };
+
+    /** @type {NodeJS.Timeout | null} */
+    let heartbeat = null;
+    if (streamId && this.directAction?.progressMessage) {
+      await emitProgressUpdate(this.directAction.progressMessage);
+      const startedAt = Date.now();
+      heartbeat = setInterval(() => {
+        const elapsedSeconds = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+        void emitProgressUpdate(`${this.directAction.progressMessage} (${elapsedSeconds}s elapsed)`);
+      }, HEARTBEAT_INTERVAL_MS);
     }
 
-    const result = await invokeDeterministicLocalAction({
-      req: this.options.req,
-      res: this.options.res,
-      agent: this.options.agent,
-      action: this.directAction,
-      prompt: payload,
-      responseMessageId: this.responseMessageId,
-      conversationId: this.conversationId,
-      parentMessageId: this.parentMessageId,
-      signal: opts.abortController?.signal ?? this.abortController?.signal,
-      userMCPAuthMap: this.options.userMCPAuthMap,
-    });
+    let result;
+    try {
+      result = await invokeDeterministicLocalAction({
+        req: this.options.req,
+        res: this.options.res,
+        agent: this.options.agent,
+        action: this.directAction,
+        prompt: payload,
+        responseMessageId: this.responseMessageId,
+        conversationId: this.conversationId,
+        parentMessageId: this.parentMessageId,
+        signal: opts.abortController?.signal ?? this.abortController?.signal,
+        userMCPAuthMap: this.options.userMCPAuthMap,
+      });
+    } finally {
+      if (heartbeat) {
+        clearInterval(heartbeat);
+      }
+    }
 
     return {
       completion: result.text,

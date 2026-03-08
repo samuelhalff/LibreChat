@@ -1432,6 +1432,16 @@ function formatStructuredToolContent(content) {
     return null;
   }
 
+  if (parsed.status === 'timed_out') {
+    const timeoutSeconds =
+      typeof parsed.timeout_seconds === 'number' || typeof parsed.timeout_seconds === 'string'
+        ? parsed.timeout_seconds
+        : null;
+    const taskId = typeof parsed.task_id === 'string' && parsed.task_id.trim() ? parsed.task_id.trim() : null;
+    const timeoutLabel = timeoutSeconds != null ? `${timeoutSeconds}s` : 'the configured limit';
+    return `Timed out after ${timeoutLabel}.${taskId ? ` Task ${taskId} stopped before finishing.` : ''} Use /queue to run longer background work if needed.`;
+  }
+
   if (parsed.ok === false && typeof parsed.error === 'string' && parsed.error.trim()) {
     return parsed.error.trim();
   }
