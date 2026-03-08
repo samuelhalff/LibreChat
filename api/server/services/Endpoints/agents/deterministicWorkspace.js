@@ -25,6 +25,24 @@ const QUEUE_STATUSES = new Set([
   'timed_out',
   'cancelled',
 ]);
+const DOMAIN_LIKE_SUFFIXES = new Set([
+  'ai',
+  'app',
+  'ch',
+  'co',
+  'com',
+  'de',
+  'dev',
+  'eu',
+  'fr',
+  'info',
+  'io',
+  'me',
+  'net',
+  'org',
+  'pt',
+  'uk',
+]);
 const LOCAL_AGENT_HELP_TEXT =
   'This local worker is deterministic. Name a workspace under /home/sam/dev, ask to list workspaces, or use /queue, /queue-list, /queue-run-next, /steer, or /queue-cancel.';
 
@@ -195,22 +213,43 @@ function listWorkspaceEntries({ devRoot = DEV_ROOT, scratchRoot = SCRATCH_ROOT }
   return entries.sort((a, b) => a.ref.localeCompare(b.ref));
 }
 
+function addWorkspaceAliasVariants(aliases, value) {
+  if (!value) {
+    return;
+  }
+
+  const normalized = value.trim().replace(/^\/+|\/+$/g, '').toLowerCase();
+  if (!normalized) {
+    return;
+  }
+
+  aliases.add(normalized);
+  aliases.add(slugify(normalized));
+
+  const tokens = normalized.split(/[^a-z0-9]+/).filter(Boolean);
+  if (tokens.length === 0) {
+    return;
+  }
+
+  aliases.add(tokens.join(' '));
+  aliases.add(tokens.join('-'));
+  aliases.add(tokens.join(''));
+
+  const lastToken = tokens[tokens.length - 1];
+  if (normalized.includes('.') && DOMAIN_LIKE_SUFFIXES.has(lastToken) && tokens.length > 1) {
+    const coreTokens = tokens.slice(0, -1);
+    aliases.add(coreTokens.join(' '));
+    aliases.add(coreTokens.join('-'));
+    aliases.add(coreTokens.join(''));
+  }
+}
+
 function workspaceAliases(entry) {
   const values = [entry.name, entry.ref, path.basename(entry.path), path.basename(entry.target)];
   const aliases = new Set();
 
   for (const value of values) {
-    if (!value) {
-      continue;
-    }
-
-    const normalized = value.trim().replace(/^\/+|\/+$/g, '').toLowerCase();
-    if (!normalized) {
-      continue;
-    }
-
-    aliases.add(normalized);
-    aliases.add(slugify(normalized));
+    addWorkspaceAliasVariants(aliases, value);
   }
 
   return aliases;
@@ -277,13 +316,13 @@ function resolveWorkspaceRef(ref, entries = listWorkspaceEntries()) {
   ];
 
   for (const candidate of lookupPaths) {
-    if (!fs.existsSync(candidate)) {
-      continue;
-    }
-
     const workspace = workspaceRootForPath(candidate, entries);
     if (workspace) {
       return workspace;
+    }
+
+    if (!fs.existsSync(candidate)) {
+      continue;
     }
   }
 
@@ -312,8 +351,8 @@ function extractWorkspaceHintFromText(text) {
   }
 
   const contextualPatterns = [
-    /\b(?:workspace|repo|project)\s+[`'"]?([A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)?)\b/i,
-    /\b(?:in|inside|under|within|for)\s+[`'"]?([A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)?)\b/i,
+    /\b(?:workspace|repo|project)\s+[`'"]?([A-Za-z0-9._-]+(?:[\s\/][A-Za-z0-9._-]+){0,3})\b/i,
+    /\b(?:in|inside|under|within|for)\s+[`'"]?([A-Za-z0-9._-]+(?:[\s\/][A-Za-z0-9._-]+){0,3})\b/i,
   ];
 
   for (const pattern of contextualPatterns) {
@@ -534,11 +573,12 @@ function getDeterministicWorkspaceDispatch({ agent, text, skip = false, entries 
   }
 
   const leadingMatch = matchLeadingWorkspaceEntry(text, entries);
+  const extractedWorkspace = resolveWorkspaceRef(extractWorkspaceHintFromText(text), entries);
   const workspace = leadingMatch?.isBare
     ? null
     : leadingMatch?.entry.path ??
-      extractWorkspaceHintFromText(text) ??
-      inferWorkspaceFromText(text, entries);
+      inferWorkspaceFromText(text, entries) ??
+      extractedWorkspace;
   if (!workspace) {
     return null;
   }
@@ -676,7 +716,9 @@ async function resolveDeterministicWorkspaceDispatch({
     return null;
   }
 
-  const workspace = extractWorkspaceHintFromText(text) ?? inferWorkspaceFromText(text, entries);
+  const workspace =
+    inferWorkspaceFromText(text, entries) ??
+    resolveWorkspaceRef(extractWorkspaceHintFromText(text), entries);
   if (!workspace) {
     return null;
   }
@@ -1233,17 +1275,9 @@ function hasPotentialWorkspaceHint(text) {
     return false;
   }
 
-  if (
-    /\/home\/sam\/dev\/[A-Za-z0-9._/\-]+/.test(text) ||
-    /(?:_scratch|_templates|_archive)\/[A-Za-z0-9._-]+/.test(text)
-  ) {
-    return true;
-  }
-
-  return [
-    /\b(?:workspace|repo|project)\s+[`'"]?[A-Za-z0-9][A-Za-z0-9._-]*(?:\s+[A-Za-z0-9][A-Za-z0-9._-]*){0,3}\b/i,
-    /\b(?:in|inside|under|within)\s+[`'"]?[A-Za-z0-9][A-Za-z0-9._-]*(?:\s+[A-Za-z0-9][A-Za-z0-9._-]*){0,3}\b/i,
-  ].some((pattern) => pattern.test(text));
+  // Always return true — workspace list is cached (60s TTL) so MCP calls are cheap.
+  // This lets fuzzy/voice workspace references like "ark fid" reach the matching pipeline.
+  return true;
 }
 
 async function resolveDeterministicLocalAction({
